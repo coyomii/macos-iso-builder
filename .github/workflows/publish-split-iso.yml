@@ -1,0 +1,139 @@
+name: Publish existing Tahoe ISO as split release
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-tahoe-26-7-1-split
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-15-intel
+    timeout-minutes: 80
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      IMAGE_NAME: macOS_Tahoe_26.7.1.iso
+      ARTIFACT_ID: '12397808552'
+      SOURCE_RUN_ID: '39711998404'
+      IMAGE_BYTES: '19989219328'
+      IMAGE_SHA256: 0389382d4f6c6b9aa42fcc588f29f5021aeea1be92fcff756f96f9a19374ed71
+      RELEASE_TAG: tahoe-26.7.1-split-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Download and verify the existing ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h .
+          available_kb=$(df -k . | tail -1 | awk '{print $4}')
+          test "$available_kb" -ge 45000000
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID" > artifact.json
+          jq -e --arg name "$IMAGE_NAME" --arg hash "sha256:$IMAGE_SHA256" \
+            --argjson bytes "$IMAGE_BYTES" --argjson run "$SOURCE_RUN_ID" \
+            '.expired == false and .name == $name and .size_in_bytes == $bytes and .digest == $hash and .workflow_run.id == $run' \
+            artifact.json
+          # upload-artifact v7 used archive:false, so this endpoint serves the ISO itself.
+          curl --fail --show-error --location --retry 3 --retry-all-errors \
+            --retry-delay 5 --connect-timeout 30 --max-time 1800 \
+            --proto '=https' --proto-redir '=https' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -o "$IMAGE_NAME" "$GITHUB_API_URL/repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip"
+          test "$(stat -f%z "$IMAGE_NAME")" = "$IMAGE_BYTES"
+          printf '%s  %s\n' "$IMAGE_SHA256" "$IMAGE_NAME" | shasum -a 256 -c -
+
+      - name: Split the ISO and create checksums and merge instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          image = Path(os.environ['IMAGE_NAME'])
+          output = Path('release-parts')
+          output.mkdir()
+          part_bytes = 1_900_000_000
+          parts = []
+          checksums = [f"{os.environ['IMAGE_SHA256']}  {image.name}\n"]
+          with image.open('rb') as source:
+              while True:
+                  block = source.read(min(1024 * 1024, part_bytes))
+                  if not block:
+                      break
+                  part = output / f'{image.name}.{len(parts) + 1:03d}'
+                  digest = hashlib.sha256()
+                  written = 0
+                  with part.open('wb') as target:
+                      while block:
+                          target.write(block)
+                          digest.update(block)
+                          written += len(block)
+                          if written == part_bytes:
+                              break
+                          block = source.read(min(1024 * 1024, part_bytes - written))
+                  parts.append(part)
+                  checksums.append(f'{digest.hexdigest()}  {part.name}\n')
+                  print(f'{part.name}: {written} bytes', flush=True)
+          assert sum(part.stat().st_size for part in parts) == int(os.environ['IMAGE_BYTES'])
+          (output / 'SHA256SUMS.txt').write_text(''.join(checksums), encoding='utf-8')
+          merge_command = 'copy /b ' + '+'.join(part.name for part in parts) + ' ' + image.name
+          notes = f'''macOS Tahoe 26.7.1 installer ISO, split into {len(parts)} raw binary parts.
+
+          Source build: https://github.com/{os.environ['GH_REPO']}/actions/runs/{os.environ['SOURCE_RUN_ID']}
+          Original file: {image.name}
+          Original size: {os.environ['IMAGE_BYTES']} bytes
+          Original SHA-256: {os.environ['IMAGE_SHA256']}
+
+          Download ALL {len(parts)} numbered files (.001 through .{len(parts):03d}) into the same folder.
+          Each part is at most 1,900,000,000 bytes, below GitHub's per-asset limit.
+          Keep the original filenames. These are raw file parts, not ZIP archives.
+          Allow about 40 GB of free space for both the parts and the merged ISO.
+
+          Windows (Command Prompt / CMD, in the download folder):
+          {merge_command}
+
+          Windows PowerShell: verify the merged ISO:
+          (Get-FileHash -LiteralPath ./{image.name} -Algorithm SHA256).Hash
+          It must match the original SHA-256 above.
+
+          macOS / Linux (Terminal, in the download folder):
+          cat {image.name}.[0-9][0-9][0-9] > {image.name}
+          shasum -a 256 -c SHA256SUMS.txt
+          On Linux, sha256sum -c SHA256SUMS.txt also works.
+
+          The reconstructed ISO is byte-for-byte identical to the verified source artifact.
+          '''
+          (output / 'MERGE-INSTRUCTIONS.txt').write_text(notes, encoding='utf-8')
+          PY
+
+      - name: Upload all parts and publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
+            --title 'macOS Tahoe 26.7.1 ISO (11 split parts)' \
+            --notes-file release-parts/MERGE-INSTRUCTIONS.txt
+          gh release upload "$RELEASE_TAG" release-parts/*
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release-assets.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          release = json.loads(Path('release-assets.json').read_text())
+          expected = {path.name: path.stat().st_size for path in Path('release-parts').iterdir()}
+          actual = {asset['name']: asset['size'] for asset in release['assets'] if asset['state'] == 'uploaded'}
+          assert actual == expected, 'Uploaded asset names or sizes do not match the local files'
+          print(f'Confirmed all {len(expected)} release assets are uploaded')
+          PY
+          gh release edit "$RELEASE_TAG" --draft=false
+          release_url=$(gh release view "$RELEASE_TAG" --json url --jq .url)
+          printf 'Release published: %s\n' "$release_url"
+          printf 'Download the split ISO: %s\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"
