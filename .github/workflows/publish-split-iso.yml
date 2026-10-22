@@ -122,7 +122,11 @@ jobs:
             --title 'macOS Tahoe 26.7.1 ISO (11 split parts)' \
             --notes-file release-parts/MERGE-INSTRUCTIONS.txt
           gh release upload "$RELEASE_TAG" release-parts/*
-          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release-assets.json
+          # Draft releases may not be accessible through the tag endpoint yet.
+          release_id=$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id")
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          gh api "repos/$GH_REPO/releases/$release_id" > release-assets.json
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -133,7 +137,7 @@ jobs:
           assert actual == expected, 'Uploaded asset names or sizes do not match the local files'
           print(f'Confirmed all {len(expected)} release assets are uploaded')
           PY
-          gh release edit "$RELEASE_TAG" --draft=false
-          release_url=$(gh release view "$RELEASE_TAG" --json url --jq .url)
+          release_url=$(gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+            -F draft=false --jq .html_url)
           printf 'Release published: %s\n' "$release_url"
           printf 'Download the split ISO: %s\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"
